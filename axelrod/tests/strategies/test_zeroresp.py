@@ -271,6 +271,7 @@ class TestZeroRespNoiseLadder(unittest.TestCase):
         self.assertEqual(once(7), once(7))
 
     def test_single_defection_pardoned_under_channel_noise(self):
+        observed = False
         for seed in range(1, 9):
             player = self._ladder()
             _play(
@@ -283,9 +284,11 @@ class TestZeroRespNoiseLadder(unittest.TestCase):
             )
             if player.nl_my_flips >= 1 and player.nl_pardoned >= 1:
                 self.assertGreaterEqual(player.nl_debt_ledger, 1)
+                observed = True
                 break
-        else:
-            self.fail("no pardon observed in seeds 1..8 at 5% noise")
+        self.assertTrue(
+            observed, "no pardon observed in seeds 1..8 at 5% noise"
+        )
 
     def test_persistent_defector_hits_red_line(self):
         player = self._ladder()
@@ -369,6 +372,7 @@ class TestZeroRespNoiseLadder(unittest.TestCase):
         self.assertTrue(player.is_red_line)
 
     def test_own_flips_feed_noise_est(self):
+        observed = False
         for seed in range(1, 9):
             player = self._ladder()
             _play(
@@ -381,9 +385,11 @@ class TestZeroRespNoiseLadder(unittest.TestCase):
             )
             if player.nl_my_flips >= 1:
                 self.assertGreater(player.p_noise_est, 0.0)
+                observed = True
                 break
-        else:
-            self.fail("no own flip observed in seeds 1..8 at 10% noise")
+        self.assertTrue(
+            observed, "no own flip observed in seeds 1..8 at 10% noise"
+        )
 
     def test_balance_negative_vs_defector(self):
         player = self._ladder()
@@ -396,3 +402,436 @@ class TestZeroRespNoiseLadder(unittest.TestCase):
         self.assertEqual(player.classifier["memory_depth"], float("inf"))
         self.assertTrue(player.classifier["stochastic"])
         self.assertTrue(player.classifier["manipulates_state"])
+
+
+class TestZeroRespBranchCoverage(unittest.TestCase):
+    """Direct, seeded setups for branches the match suite does not reach."""
+
+    def setUp(self):
+        ZeroResp._global_profiles = {}
+        ZeroResp._global_lengths = []
+
+    def _player(self, **over):
+        player = ZeroResp(features=Features(**over))
+        player.set_seed(1)
+        return player
+
+    def test_features_asdict_and_replace(self):
+        features = Features(noise_ladder=False, apology=True)
+        as_dict = features.asdict()
+        self.assertFalse(as_dict["noise_ladder"])
+        self.assertIn("profiles", as_dict)
+        replaced = features.replace(apology=False, noise_extra=True)
+        self.assertFalse(replaced.apology)
+        self.assertTrue(replaced.noise_extra)
+        self.assertFalse(replaced.noise_ladder)
+        self.assertIsNot(replaced, features)
+
+    def test_harvest_window_without_jitter(self):
+        player = self._player(harvest_jitter=False)
+        self.assertEqual(player._harvest_window, player.HARVEST_WINDOW)
+
+    def test_reset_trims_and_swallows_length_bookkeeping_errors(self):
+        player = self._player()
+        player.history.append(C, C)
+        ZeroResp._global_lengths = list(range(201))
+        player.reset()
+        self.assertEqual(len(player.history), 0)
+        self.assertEqual(len(ZeroResp._global_lengths), 200)
+        self.assertEqual(ZeroResp._global_lengths[-1], 1)
+
+        class _NoAppend(list):
+            def append(self, item):
+                raise RuntimeError("bookkeeping failed")
+
+        player = self._player()
+        player.history.append(D, C)
+        ZeroResp._global_lengths = _NoAppend([4, 5])
+        player.reset()
+        self.assertEqual(len(player.history), 0)
+        self.assertEqual(list(ZeroResp._global_lengths), [4, 5])
+
+    def test_length_helpers_unknown_and_invalid(self):
+        player = self._player()
+        player.match_attributes["length"] = object()
+        self.assertIsNone(player._match_length())
+
+        player.match_attributes["length"] = float("inf")
+        player.features.estimated_endgame = True
+        ZeroResp._global_lengths = [10, 40, 20]
+        self.assertEqual(player._effective_length(), 20)
+        player.features.estimated_endgame = False
+        self.assertEqual(
+            player._effective_length(), player._DEFAULT_MATCH_LENGTH
+        )
+        player.features.estimated_endgame = True
+        ZeroResp._global_lengths = []
+        self.assertEqual(
+            player._effective_length(), player._DEFAULT_MATCH_LENGTH
+        )
+
+        player.features.estimated_endgame = False
+        self.assertIsNone(player._estimate_remaining(10))
+        player.features.estimated_endgame = True
+        ZeroResp._global_lengths = [5, 6, 7]
+        self.assertEqual(player._estimate_remaining(20), 1)
+        ZeroResp._global_lengths = [30, 50, 70]
+        self.assertEqual(player._estimate_remaining(10), 41)
+
+    def test_backstabber_and_warmth_penalties(self):
+        player = self._player()
+        player.match_attributes["length"] = 100
+        player.opp_len = 80
+        player.opp_defects = 10
+        player.late_defects = 8
+        self.assertEqual(player._classify_tactical(), "backstabber")
+
+        player.my_C = 20
+        player.opp_coops_after_my_C = 10
+        player.my_D = 4
+        player.tactical = "backstabber"
+        player._forgiveness_exploiter = 2
+        player._update_target_warmth()
+        self.assertGreaterEqual(player.target_warmth, 0.10)
+        self.assertLessEqual(player.target_warmth, 0.90)
+
+    def test_noise_regime_and_unexplained_guards(self):
+        quiet = self._player(noise_adaptive=False)
+        quiet.p_noise_est = 0.2
+        quiet.cc_pairs = 50
+        self.assertFalse(quiet._is_noisy_regime())
+
+        player = self._player()
+        player._bad_standing = True
+        self.assertFalse(player._nl_is_unexplained())
+        player._bad_standing = False
+        player._contrite = True
+        self.assertFalse(player._nl_is_unexplained())
+        player._contrite = False
+        self.assertTrue(player._nl_is_unexplained())
+        player.history.append(C, D)
+        player.nl_provoked_until = 4
+        player._nl_step_hint = 4
+        self.assertFalse(player._nl_is_unexplained())
+
+    def test_ladder_window_exploit_and_harvest_plan(self):
+        player = self._player()
+        player.set_seed(2)
+        player.nl_window.append(1)
+        player.nl_evidence = 4
+        player.nl_pardon_step = 10
+        player._nl_ladder(14)
+        self.assertEqual(player.nl_evidence, 1)
+        self.assertEqual(list(player.nl_window), [14])
+        self.assertEqual(player._forgiveness_exploiter, 1)
+        self.assertEqual(player.nl_pardon_step, 0)
+
+        player = self._player()
+        player.set_seed(3)
+        player.my_D = 3
+        player.opp_coops_after_my_D = 3
+        player.nl_balance = 1
+        player.nl_evidence = 1
+        player._nl_ladder(30)
+        self.assertGreaterEqual(player.nl_harvest_size, player.NL_HARVEST_MIN)
+        self.assertLessEqual(player.nl_harvest_size, player.NL_HARVEST_MAX)
+        self.assertEqual(player.nl_harvest_left, 0)
+        self.assertEqual(player.nl_harvest_postponed, 0)
+        self.assertGreaterEqual(player.nl_harvest_scheduled_at, 36)
+        self.assertLessEqual(player.nl_harvest_scheduled_at, 40)
+
+    def test_forgiveness_budget_and_harvest_action_branches(self):
+        player = self._player()
+        player.set_seed(4)
+        player.warmth = 0.9
+        player.features.noise_extra = True
+        player.intent = "noise"
+        player.tactical = "aggressor"
+        high = player._get_forgiveness_budget()
+        player.warmth = 0.1
+        player.features.noise_extra = False
+        player.intent = "normal"
+        player.tactical = "adaptive"
+        low = player._get_forgiveness_budget()
+        self.assertGreaterEqual(high, 2)
+        self.assertLessEqual(high, 12)
+        self.assertGreaterEqual(low, 2)
+        self.assertLessEqual(low, 12)
+
+        player.features.noise_adaptive = True
+        player.p_noise_est = 0.05
+        player.cc_pairs = 15
+        player.nl_my_flips = 0
+        self.assertIsNone(player._harvest_action(4, axl.Cooperator()))
+
+        player.p_noise_est = 0.0
+        player.cc_pairs = 0
+        player.opp_len = 60
+        player.opp_defects = 0
+        player.my_D = 0
+        player.probe_fired = True
+        self.assertEqual(player._harvest_action(4, axl.Cooperator()), D)
+
+        player.opp_len = 40
+        player.opp_defects = 5
+        player.my_D = 4
+        player.opp_coops_after_my_D = 0
+        player.tactical = "aggressor"
+        self.assertEqual(player._harvest_action(3, axl.Cooperator()), D)
+
+    def test_play_bad_standing_and_noise_extra_thresholds(self):
+        player = self._player()
+        self.assertEqual(player._play(C), C)
+        self.assertEqual(player._intended_prev, C)
+
+        player._bad_standing = True
+        player._bad_standing_turns = 2
+        player._contrite = True
+        self.assertTrue(player._on_defect(8, D))
+        self.assertTrue(player._bad_standing)
+        self.assertEqual(player._bad_standing_turns, 1)
+        self.assertFalse(player._contrite)
+        player._bad_standing_turns = 1
+        self.assertTrue(player._on_defect(9, D))
+        self.assertFalse(player._bad_standing)
+
+        player = self._player()
+        player.features.noise_extra = True
+        player.intent = "noise"
+        self.assertFalse(player._on_defect(10, D))
+        self.assertFalse(player.is_red_line)
+        self.assertGreaterEqual(len(player.queue), 1)
+
+    def test_close_epoch_and_profile_guards(self):
+        player = self._player()
+        player.p_noise_est = 0.0
+        player.cc_pairs = 0
+        player._enter_red_line()
+        player.epoch_step = 40
+        player.debt = 0
+        player.queue = []
+        player._close_epoch()
+        self.assertEqual(player.epoch_step, 40)
+        self.assertEqual(player._state.name, "RED_LINE")
+
+        bare = ZeroResp(use_profiles=False)
+        bare.set_seed(1)
+        bare._save_profile("Defector")
+        self.assertEqual(ZeroResp._global_profiles, {})
+        self._player()._save_profile("")
+        self.assertEqual(ZeroResp._global_profiles, {})
+
+    def test_balance_uses_payoff_when_game_score_fails(self):
+        class _Boom:
+            def score(self, pair):
+                raise ValueError("bad score")
+
+        player = self._player()
+        player.history.append(D, C)
+        player._intended_prev = D
+        opponent = axl.Cooperator()
+        opponent.history.append(C, D)
+        player.match_attributes["game"] = _Boom()
+        player.strategy(opponent)
+        self.assertEqual(player.nl_balance, 5)
+
+    def _late_player(self):
+        player = self._player()
+        player.match_attributes["length"] = 4
+        player.history.extend([C, C, C], [C, C, C])
+        player._apology_mode = False
+        return player
+
+    def test_apology_accounting_retry_and_give_up(self):
+        player = self._late_player()
+        player._apology_mode = True
+        player._apology_steps = 4
+        player.last_my = D
+        opponent = axl.Defector()
+        opponent.history.append(D, C)
+        self.assertEqual(player.strategy(opponent), C)
+        self.assertGreaterEqual(player.late_defects, 1)
+        self.assertGreaterEqual(player.my_D, 1)
+
+        player = self._late_player()
+        player._apology_mode = True
+        player._apology_steps = 4
+        player.last_my = D
+        opponent = axl.Cooperator()
+        opponent.history.append(C, D)
+        self.assertEqual(player.strategy(opponent), C)
+        self.assertGreaterEqual(player.opp_coops_after_my_D, 1)
+        self.assertEqual(player.clean_peace, 0)
+        self.assertGreaterEqual(player.my_D, 1)
+
+        player = self._player()
+        player._apology_mode = True
+        player._apology_steps = 1
+        player._apology_tries = 0
+        player._apology_opp_moves = []
+        opponent = axl.Defector()
+        opponent.history.append(D, C)
+        player.strategy(opponent)
+        self.assertFalse(player._apology_mode)
+        self.assertFalse(player.is_red_line)
+        self.assertEqual(player._apology_tries, 1)
+
+        player = self._player()
+        player._apology_mode = True
+        player._apology_steps = 1
+        player._apology_tries = player._apology_max_tries - 1
+        player._apology_opp_moves = [D]
+        opponent = axl.Defector()
+        opponent.history.append(D, C)
+        self.assertEqual(player.strategy(opponent), D)
+        self.assertTrue(player.is_red_line)
+        self.assertEqual(player._last_D_reason, "red_line")
+
+    def test_contrite_full_and_plain_contrite_accounting(self):
+        player = self._late_player()
+        player._bad_standing = True
+        player._bad_standing_turns = 2
+        player.last_my = D
+        opponent = axl.Defector()
+        opponent.history.append(D, C)
+        self.assertEqual(player.strategy(opponent), C)
+        self.assertGreaterEqual(player.late_defects, 1)
+        self.assertGreaterEqual(player.my_D, 1)
+
+        player = self._late_player()
+        player._bad_standing = True
+        player._bad_standing_turns = 2
+        player.last_my = D
+        opponent = axl.Cooperator()
+        opponent.history.append(C, D)
+        self.assertEqual(player.strategy(opponent), C)
+        self.assertGreaterEqual(player.opp_coops_after_my_D, 1)
+        self.assertGreaterEqual(player.my_D, 1)
+
+        def contrite(my_prev):
+            actor = self._late_player()
+            actor.opp_len = 4
+            actor.last_my = my_prev
+            actor._contrite = True
+            actor._bad_standing = False
+            foe = axl.Defector()
+            foe.history.extend([D] * 5, [C] * 5)
+            action = actor.strategy(foe)
+            return actor, action
+
+        soft, action = contrite(C)
+        self.assertEqual(action, C)
+        self.assertFalse(soft._contrite)
+        self.assertGreaterEqual(soft.opp_defects_after_my_C, 1)
+        self.assertGreaterEqual(soft.late_defects, 1)
+        self.assertGreaterEqual(soft.my_C, 1)
+        hard, action = contrite(D)
+        self.assertEqual(action, C)
+        self.assertGreaterEqual(hard.my_D, 1)
+        self.assertGreaterEqual(hard.late_defects, 1)
+
+    def test_noise_ladder_harvest_and_scheduled_strike(self):
+        player = self._player()
+        player.nl_harvest_scheduled_at = 1
+        player.nl_harvest_size = 3
+        opponent = axl.Cooperator()
+        opponent.history.append(C, C)
+        self.assertEqual(player.strategy(opponent), D)
+        self.assertEqual(player._last_D_reason, "nl_harvest_comp")
+        self.assertEqual(player.nl_harvest_left, 2)
+        self.assertEqual(player.nl_harvest_scheduled_at, 0)
+        self.assertEqual(player.nl_provoked_until, 7)
+
+        player = self._player()
+        player.nl_harvest_scheduled_at = 1
+        player.nl_harvest_size = 3
+        player.strategy(axl.Cooperator())
+        self.assertEqual(player.nl_harvest_postponed, 1)
+        self.assertEqual(player.nl_harvest_scheduled_at, 4)
+
+        player = self._player()
+        player.nl_harvest_scheduled_at = 1
+        player.nl_harvest_size = 3
+        player.nl_harvest_postponed = 2
+        player.strategy(axl.Cooperator())
+        self.assertEqual(player.nl_harvest_scheduled_at, 0)
+        self.assertEqual(player.nl_harvest_size, 0)
+
+        player = self._player()
+        player.opp_last3.extend([C, C, C])
+        player.opp_defects_after_my_D = 0
+        player.nl_scheduled = [{"turn": 1, "kind": "strike"}]
+        player.queue = [1]
+        player.debt = 2
+        player.nl_debt_ledger = 1
+        self.assertEqual(player.strategy(axl.Cooperator()), C)
+        self.assertEqual(player.nl_pardon_step, 1)
+        self.assertGreaterEqual(player.nl_pardoned, 1)
+        self.assertNotIn(1, player.queue)
+        self.assertEqual(player.debt, 1)
+
+        player = self._player()
+        player.opp_last3.extend([D, D, D])
+        player.nl_scheduled = [{"turn": 1, "kind": "strike"}]
+        player.nl_debt_ledger = 4
+        self.assertEqual(player.strategy(axl.Cooperator()), D)
+        self.assertEqual(player.nl_debt_ledger, 3)
+
+    def test_hostile_cooldown_deadlock_probe_and_queue(self):
+        player = self._player()
+        player.opp_len = 20
+        player.opp_defects = 18
+        self.assertEqual(player.strategy(axl.Cooperator()), D)
+        self.assertTrue(player.is_red_line)
+        self.assertEqual(player._last_D_reason, "red_line")
+
+        player = self._player()
+        player.p_noise_est = 0.05
+        player.cc_pairs = 20
+        player._enter_red_line()
+        player._red_line_cooldown = 0
+        self.assertEqual(player._state.name, "RED_LINE_COOLDOWN")
+        self.assertEqual(player.strategy(axl.Cooperator()), C)
+        self.assertGreater(player._red_line_cooldown, 0)
+        self.assertEqual(player._last_D_reason, None)
+
+        player = self._player()
+        player.deadlock = player.DEADLOCK_THRESHOLD
+        player.queue = [99]
+        player.debt = 3
+        player.systemic = 4
+        player.echo_forgive = 2
+        player._contrite = True
+        player._bad_standing = True
+        self.assertEqual(player.strategy(axl.Cooperator()), C)
+        self.assertEqual(player.deadlock, 0)
+        self.assertEqual(player.queue, [])
+        self.assertEqual(player.debt, 0)
+        self.assertEqual(player.echo_forgive, 0)
+        self.assertEqual(player.systemic, 3)
+        self.assertFalse(player._contrite)
+        self.assertFalse(player._bad_standing)
+        self.assertEqual(player._state.name, "COOPERATIVE")
+
+        player = self._player(harvest_jitter=False)
+        player.match_attributes["length"] = 5
+        player.opp_len = 40
+        player.opp_defects = 0
+        player.probe_fired = True
+        player.tactical = "adaptive"
+        self.assertEqual(player.strategy(axl.Cooperator()), D)
+        self.assertEqual(player._last_D_reason, "probe")
+
+        player = self._player()
+        player.match_attributes["length"] = 200
+        player.queue = [1]
+        player._contrite = True
+        self.assertEqual(player.strategy(axl.Cooperator()), C)
+        self.assertEqual(player.queue, [2])
+        self.assertTrue(player._contrite)
+
+        player = self._player()
+        player.match_attributes["length"] = 200
+        player._contrite = True
+        self.assertEqual(player.strategy(axl.Cooperator()), C)
+        self.assertFalse(player._contrite)
