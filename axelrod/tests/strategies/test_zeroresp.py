@@ -224,9 +224,7 @@ class TestZeroResp(TestPlayer):
             axl.Grudger(),
             axl.Random(),
         ]
-        tournament = axl.Tournament(
-            players, turns=50, repetitions=1, seed=0
-        )
+        tournament = axl.Tournament(players, turns=50, repetitions=1, seed=0)
         results = tournament.play(progress_bar=False)
         names = results.ranked_names
         zr = next(n for n in names if n.startswith("ZeroResp"))
